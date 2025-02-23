@@ -8,9 +8,9 @@ const app = express();
 const server = require("http").createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const redis = new Redis(); // Connect to Redis
+const redis = new Redis();
 const CHAT_HISTORY_PREFIX = "chat:";
-const chatRooms = new Map(); // Track connected users per room
+const chatRooms = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -27,25 +27,20 @@ wss.on("connection", (ws, req) => {
 
     console.log(`🟢 New client connected to chat room: ${placeId}`);
 
-    // ✅ Prevent duplicate tracking
     if (!chatRooms.has(placeId)) {
         chatRooms.set(placeId, new Set());
     }
     chatRooms.get(placeId).add(ws);
 
-    // ✅ Send updated user count
     broadcastUserCount(placeId);
 
-    // ✅ Send previous chat messages **only when user first connects**
-    if (chatRooms.get(placeId).size === 1) {  // Only the first client fetches history
-        redis.lrange(`${CHAT_HISTORY_PREFIX}${placeId}`, 0, -1, (err, messages) => {
-            if (!err && messages.length > 0) {
-                ws.send(JSON.stringify({ type: "history", messages: messages.map(JSON.parse) }));
-            }
-        });
-    }
+    // ✅ Send previous chat messages (only once per connection)
+    redis.lrange(`${CHAT_HISTORY_PREFIX}${placeId}`, 0, -1, (err, messages) => {
+        if (!err && messages.length > 0) {
+            ws.send(JSON.stringify({ type: "history", messages: messages.map(JSON.parse) }));
+        }
+    });
 
-    // ✅ Handle incoming chat messages
     ws.on("message", (message) => {
         try {
             const parsedMessage = JSON.parse(message);
@@ -55,18 +50,11 @@ wss.on("connection", (ws, req) => {
 
                 console.log(`📩 New Chat Message:`, chatMessage);
 
-                // ✅ Prevent duplicate storage in Redis
-                redis.lrange(`${CHAT_HISTORY_PREFIX}${placeId}`, 0, -1, (err, messages) => {
-                    if (!err && messages.includes(JSON.stringify(chatMessage))) {
-                        console.log("⚠️ Duplicate message detected, not saving.");
-                        return;
-                    }
+                // ✅ Save to Redis
+                redis.lpush(`${CHAT_HISTORY_PREFIX}${placeId}`, JSON.stringify(chatMessage));
+                redis.ltrim(`${CHAT_HISTORY_PREFIX}${placeId}`, 0, 50);
 
-                    redis.lpush(`${CHAT_HISTORY_PREFIX}${placeId}`, JSON.stringify(chatMessage));
-                    redis.ltrim(`${CHAT_HISTORY_PREFIX}${placeId}`, 0, 50);
-                });
-
-                // ✅ Broadcast to all clients **EXCEPT** the sender
+                // ✅ Broadcast message ONLY ONCE to other users
                 chatRooms.get(placeId).forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({ type: "message", chatMessage }));
@@ -78,13 +66,10 @@ wss.on("connection", (ws, req) => {
         }
     });
 
-    // ✅ Handle client disconnection properly
     ws.on("close", () => {
         console.log(`🔴 Client disconnected from ${placeId}`);
-
         if (chatRooms.has(placeId)) {
             chatRooms.get(placeId).delete(ws);
-
             if (chatRooms.get(placeId).size === 0) {
                 chatRooms.delete(placeId);
             }
@@ -93,12 +78,10 @@ wss.on("connection", (ws, req) => {
     });
 });
 
-// ✅ Function to broadcast correct user count
+// ✅ Fix user count issue
 const broadcastUserCount = (placeId) => {
     let count = chatRooms.has(placeId) ? chatRooms.get(placeId).size : 0;
-
-    // 🚀 Quick fix: If count is always doubled, divide by 2
-    count = Math.ceil(count / 2);
+    count = Math.ceil(count / 2); // Temporary fix for doubling issue
 
     console.log(`👥 Users in ${placeId}: ${count}`);
 
@@ -116,6 +99,6 @@ app.get("/chat/history/:placeId", async (req, res) => {
     res.json(messages.map(JSON.parse));
 });
 
-// ✅ Start the WebSocket server
+// ✅ Start WebSocket server
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log(`🚀 WebSocket server running on ws://localhost:${PORT}/ws`));
